@@ -101,6 +101,7 @@ func (d *Database) Initialize() error {
 	return nil
 }
 
+// Start is used to create a listener for the Database and start a server loop to handle sessions. This function will not return unless the server shuts down.
 func (d *Database) Start(proto, addr string) error {
 	if !d.initialized {
 		return xerrors.New("server cannot start until the database is initialized")

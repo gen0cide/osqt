@@ -279,6 +279,7 @@ func (t *Table) ExtractNames(node *past.Call) error {
 	return nil
 }
 
+// ToSQLSchema creates a virtual sql.Schema definition to be used in construction of the virtual database.
 func (t *Table) ToSQLSchema(extendedSchemas []string) sql.Schema {
 	cols := []*sql.Column{}
 	for _, col := range t.Schema.Columns {

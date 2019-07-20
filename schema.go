@@ -25,6 +25,7 @@ var CanonicalPlatforms = map[string]string{
 	"linwin":    "Linux and Windows",
 }
 
+// GOOSToApplicableNamespaces is a helper to let you lookup OSQuery namespaces relating to a given GOOS runtime.
 var GOOSToApplicableNamespaces = map[string][]string{
 	"linux": []string{
 		"specs",
