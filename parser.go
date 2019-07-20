@@ -1,24 +1,28 @@
 package osqt
 
 import (
-	"fmt"
-	"io"
+	"encoding/json"
+	"io/ioutil"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	past "github.com/go-python/gpython/ast"
 	gparser "github.com/go-python/gpython/parser"
-	"github.com/k0kubun/pp"
 	"github.com/karrick/godirwalk"
+	"go.uber.org/zap"
+	"gopkg.in/yaml.v3"
 )
 
 // Parser is a directory walking extraction of OSQuery table definitions. (usually specs/)
 type Parser struct {
 	sync.RWMutex
 
-	BaseDir string
-	Tables  map[string]*Table `json:"tables,omitempty"`
+	SchemaFile string
+	BaseDir    string
+	Logger     *zap.SugaredLogger
+	Namespaces map[string]*Namespace `json:"namespaces,omitempty" yaml:"namespaces,omitempty"`
 }
 
 // SourceFile is used to define a file containing an OSQuery table definition.
@@ -27,33 +31,77 @@ type SourceFile struct {
 	Table *Table
 }
 
-// Table represents an OSQuery table and all of it's properties and schema.
-type Table struct {
-	Name           string                 `json:"name,omitempty" yaml:"name,omitempty"`
-	Aliases        []string               `json:"aliases,omitempty" yaml:"aliases,omitempty"`
-	Description    string                 `json:"description,omitempty" yaml:"description,omitempty"`
-	Schema         []*Column              `json:"schema,omitempty" yaml:"schema,omitempty"`
-	Attributes     map[string]interface{} `json:"attributes,omitempty" yaml:"attributes,omitempty"`
-	Implementation string                 `json:"implementation,omitempty" yaml:"implementation,omitempty"`
-	FuzzPaths      []string               `json:"fuzz_paths,omitempty" yaml:"fuzz_paths,omitempty"`
-}
-
-// Column represents a column definition within an OSQuery table declaration.
-type Column struct {
-	Index       int                    `json:"index" yaml:"index"`
-	Name        string                 `json:"name,omitempty" yaml:"name,omitempty"`
-	Type        string                 `json:"type,omitempty" yaml:"type,omitempty"`
-	Description string                 `json:"description,omitempty" yaml:"description,omitempty"`
-	Aliases     []string               `json:"aliases,omitempty" yaml:"aliases,omitempty"`
-	Options     map[string]interface{} `json:"options,omitempty" yaml:"options,omitempty"`
-}
-
 // NewParser returns a new parser for extracting structured OSQuery
 // table definitions from within their .table declaration files.
-func NewParser() *Parser {
-	return &Parser{
-		Tables: map[string]*Table{},
+func NewParser(logger *zap.SugaredLogger) *Parser {
+	if logger == nil {
+		logger = zap.L().Sugar().Named("parser")
 	}
+	return &Parser{
+		Logger:     logger,
+		Namespaces: map[string]*Namespace{},
+	}
+}
+
+// ParseYAMLSchemaFile attempts to recreate a table structure from a YAML schema definition.
+func (p *Parser) ParseYAMLSchemaFile(fileloc string) error {
+	filebytes, err := ioutil.ReadFile(fileloc)
+	if err != nil {
+		return err
+	}
+
+	tables := map[string]*Namespace{}
+	err = yaml.Unmarshal(filebytes, &tables)
+	if err != nil {
+		return err
+	}
+
+	return p.InjectTables(tables)
+}
+
+// ParseJSONSchemaFile attempts to parse a table structure from a JSON schema definition.
+func (p *Parser) ParseJSONSchemaFile(fileloc string) error {
+	filebytes, err := ioutil.ReadFile(fileloc)
+	if err != nil {
+		return err
+	}
+
+	tables := map[string]*Namespace{}
+	err = json.Unmarshal(filebytes, &tables)
+	if err != nil {
+		return err
+	}
+
+	return p.InjectTables(tables)
+}
+
+// InjectTables is used to "wire up" tables and their child types with the current Parser.
+func (p *Parser) InjectTables(raw map[string]*Namespace) error {
+	for nsid, ns := range raw {
+		if ns.parser == nil {
+			ns.parser = p
+		}
+		for tname, table := range ns.Tables {
+			table.logger = ns.Logger().Named(tname)
+			table.Namespace = ns
+			if table.NamespaceID == "" {
+				table.NamespaceID = nsid
+			}
+			if table.Schema != nil {
+				table.Schema.logger = table.logger.Named("schema")
+				table.Schema.Table = table
+			}
+
+			for esname, es := range table.ExtendedSchemas {
+				es.logger = table.logger.Named("extended_schema").Named(esname)
+				es.Table = table
+			}
+		}
+
+		p.Namespaces[nsid] = ns
+	}
+
+	return nil
 }
 
 // ParseDirectory walks a directory structure for all .table files and attempts to parse
@@ -64,13 +112,28 @@ func (p *Parser) ParseDirectory(location string) error {
 	finchan := make(chan bool, 1)
 
 	go func() {
+		p.Logger.Debug("Starting record keeping worker.")
 		p.Lock()
 		defer func() {
+			p.Logger.Debug("Shutting down record keeping worker.")
 			finchan <- true
 		}()
 		defer p.Unlock()
 		for src := range reschan {
-			p.Tables[src.Table.Name] = src.Table
+			namespaceID := filepath.Base(filepath.Dir(src.Path))
+			namespaceDescription, ok := CanonicalPlatforms[namespaceID]
+			if !ok {
+				p.Logger.Fatalw("Could not find namespace", "nsid", namespaceID, "path", src.Path, "dir", filepath.Dir(src.Path), "base", filepath.Base(filepath.Dir(src.Path)))
+			}
+			p.Logger.Debugw("Table recorded", "table", src.Table.Name, "nsid", namespaceID, "ns", namespaceDescription)
+			ns, ok := p.Namespaces[namespaceID]
+			if !ok {
+				ns = NewNamespace(namespaceID, namespaceDescription, p, nil)
+				p.Namespaces[namespaceID] = ns
+			}
+			src.Table.NamespaceID = namespaceID
+			src.Table.Namespace = ns
+			ns.Tables[src.Table.Name] = src.Table
 		}
 	}()
 
@@ -78,19 +141,16 @@ func (p *Parser) ParseDirectory(location string) error {
 
 	go func() {
 		defer close(reschan)
+		p.Logger.Debug("Walking base directory.")
 		err := godirwalk.Walk(p.BaseDir, &godirwalk.Options{
 			Callback: func(fileloc string, de *godirwalk.Dirent) error {
 				if !de.IsRegular() || filepath.Ext(fileloc) != ".table" {
 					return nil
 				}
-				fin, err := os.Open(fileloc)
-				if err != nil {
-					return err
-				}
 
-				tbl, err := ParseTableDef(fin)
+				tbl, err := p.ParseTableDef(fileloc)
 				if err != nil {
-					pp.Println(fileloc)
+					p.Logger.Warnw("Error parsing spec file.", "file", fileloc, "error", err)
 					return err
 				}
 
@@ -115,30 +175,22 @@ func (p *Parser) ParseDirectory(location string) error {
 	}
 }
 
-// NewEmptyTable is a constructor for the Table type.
-func NewEmptyTable() *Table {
-	return &Table{
-		Aliases:    []string{},
-		Schema:     []*Column{},
-		Attributes: map[string]interface{}{},
-		FuzzPaths:  []string{},
-	}
-}
-
-// NewEmptyColumn creates a new empty Column object.
-func NewEmptyColumn() *Column {
-	return &Column{
-		Aliases: []string{},
-		Options: map[string]interface{}{},
-	}
-}
-
 // ParseTableDef takes an input of Python source and attempts to extract an OSQuery table
 // definition by extracting the information out of the Python AST that is generated
 // on the fly.
-func ParseTableDef(in io.Reader) (*Table, error) {
-	t := &Table{}
-	gpyast, err := gparser.Parse(in, "", "exec")
+func (p *Parser) ParseTableDef(fileloc string) (*Table, error) {
+	freader, err := os.Open(fileloc)
+	if err != nil {
+		p.Logger.Debugw("Error encountered opening spec file.", "file", fileloc, "error", err)
+		return nil, err
+	}
+
+	filename := strings.Replace(filepath.Base(fileloc), ".table", "", -1)
+
+	t := NewEmptyTable()
+	t.Name = filename
+	t.logger = p.Logger.Named(filename)
+	gpyast, err := gparser.Parse(freader, filepath.Base(fileloc), "exec")
 	if err != nil {
 		return nil, err
 	}
@@ -146,173 +198,4 @@ func ParseTableDef(in io.Reader) (*Table, error) {
 	past.Walk(gpyast, t.Visit)
 
 	return t, nil
-}
-
-// Visit is the AST walk implementation for the Python interpreter.
-func (t *Table) Visit(pyast past.Ast) bool {
-	switch node := pyast.(type) {
-	case *past.Call:
-		return t.VisitorBranch(node)
-	default:
-		return true
-	}
-}
-
-// VisitorBranch attempts to route the node extraction based on the caller function name.
-func (t *Table) VisitorBranch(node *past.Call) bool {
-	funcToken, ok := node.Func.(*past.Name)
-	if !ok {
-		pp.Println("Failed AST Node")
-		pp.Println(node)
-		return false
-	}
-
-	funcName := string(funcToken.Id)
-	switch funcName {
-	case "table_name":
-		err := t.ExtractNames(node)
-		if err != nil {
-			panic(err)
-		}
-	case "description":
-		err := t.ExtractDescription(node)
-		if err != nil {
-			panic(err)
-		}
-	case "schema":
-		err := t.ExtractSchema(node)
-		if err != nil {
-			panic(err)
-		}
-	case "Column":
-		return false
-	case "attributes":
-		fmt.Printf("[%s] Skipping attributes() Parsing for table\n", t.Name)
-		return false
-	case "implementation":
-		err := t.ExtractImplementation(node)
-		if err != nil {
-			panic(err)
-		}
-	case "fuzz_paths":
-		fmt.Printf("[%s] Skipping fuzz_path() Parsing for table\n", t.Name)
-		return false
-	case "extended_schema":
-		fmt.Printf("[%s] Skipping extended_schema() Parsing for table\n", t.Name)
-		return false
-	case "examples":
-		fmt.Printf("[%s] Skipping examples() Parsing for table\n", t.Name)
-		return false
-	case "ForeignKey":
-		return false
-	default:
-		fmt.Printf("[%s] Unhandled Caller: %s\n", t.Name, funcName)
-		pp.Println(node)
-		return false
-	}
-
-	return true
-}
-
-// ExtractSchema attempts to extract the schema([]) declaraction.
-func (t *Table) ExtractSchema(node *past.Call) error {
-	arglist, ok := node.Args[0].(*past.List)
-	if !ok {
-		return fmt.Errorf("argument 0 was not of type *arg.List (%s)", t.Name)
-	}
-	for colidx, coldef := range arglist.Elts {
-		coldefcaller, ok := coldef.(*past.Call)
-		if !ok {
-			return fmt.Errorf("argument %d was not of type *ast.Call (%s)", colidx, t.Name)
-		}
-
-		col := NewEmptyColumn()
-		col.Index = colidx
-
-		if len(coldefcaller.Args) < 1 {
-			fmt.Printf("[%s] Non Column() definition detected! Skipping...", t.Name)
-			continue
-		}
-
-		if nameObj, ok := coldefcaller.Args[0].(*past.Str); ok {
-			col.Name = string(nameObj.S)
-		}
-
-		if typeObj, ok := coldefcaller.Args[1].(*past.Name); ok {
-			col.Type = string(typeObj.Id)
-		}
-
-		if descObj, ok := coldefcaller.Args[2].(*past.Str); ok {
-			col.Description = string(descObj.S)
-		}
-
-		for _, kw := range coldefcaller.Keywords {
-			optkey := string(kw.Arg)
-			switch v := kw.Value.(type) {
-			case *past.NameConstant:
-				col.Options[optkey] = v.Value
-			case *past.Str:
-				col.Options[optkey] = string(v.S)
-			case *past.Name:
-				col.Options[optkey] = string(v.Id)
-			}
-		}
-
-		t.Schema = append(t.Schema, col)
-	}
-	return nil
-}
-
-// ExtractImplementation attempts to extract the table implementation("...") declaration.
-func (t *Table) ExtractImplementation(node *past.Call) error {
-	impl, ok := node.Args[0].(*past.Str)
-	if !ok {
-		return fmt.Errorf("argument 0 was not of type string")
-	}
-	t.Implementation = string(impl.S)
-
-	return nil
-}
-
-// ExtractDescription attempts to extract the table description("...") declaration.
-func (t *Table) ExtractDescription(node *past.Call) error {
-	desc, ok := node.Args[0].(*past.Str)
-	if !ok {
-		return fmt.Errorf("argument 0 was not of type string")
-	}
-	t.Description = string(desc.S)
-
-	return nil
-}
-
-// ExtractNames attempts to parse the table_name("foo") declaration.
-func (t *Table) ExtractNames(node *past.Call) error {
-	tblname, ok := node.Args[0].(*past.Str)
-	if !ok {
-		return fmt.Errorf("argument 0 was not of type string")
-	}
-	t.Name = string(tblname.S)
-
-	if len(node.Keywords) > 0 {
-		for _, kw := range node.Keywords {
-			if string(kw.Arg) != "aliases" {
-				fmt.Printf("[!] Unhandled Keyword Argument: %s (%s)\n", string(kw.Arg), t.Name)
-				continue
-			}
-			aliasList, ok := kw.Value.(*past.List)
-			if !ok {
-				fmt.Printf("[!] aliases keyword argument is not of type *ast.List! (%s)\n", t.Name)
-				continue
-			}
-			for idx, elm := range aliasList.Elts {
-				aliasName, ok := elm.(*past.Str)
-				if !ok {
-					fmt.Printf("[!] aliases keyword argument index %d is not of type *ast.Str! (%s)\n", idx, t.Name)
-					continue
-				}
-				t.Aliases = append(t.Aliases, string(aliasName.S))
-			}
-		}
-	}
-	return nil
 }
